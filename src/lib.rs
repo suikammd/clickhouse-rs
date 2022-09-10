@@ -130,7 +130,7 @@ extern crate tokio;
 extern crate tokio_timer;
 extern crate url;
 
-use std::{fmt, time::Duration};
+use std::{fmt, sync::atomic::Ordering, time::Duration};
 
 use futures::{Future, Stream};
 use tokio::prelude::*;
@@ -267,32 +267,34 @@ impl Client {
             ..Context::default()
         };
 
-        Either::Right(
-            future::lazy(move || {
-                let addr = match &pool {
-                    None => &options.addr,
-                    Some(p) => p.get_addr(),
-                };
+        Either::Right(future::lazy(move || {
+            let addr = match &pool {
+                None => &options.addr,
+                Some(p) => {
+                    let inner = p.inner.lock().unwrap();
+                    let index = inner.inc_connections_num();
+                    p.get_addr(index)
+                }
+            };
 
-                info!("try to connect to {}", addr);
-                ConnectingStream::new(addr, &options)
-                    .and_then(move |mut stream| {
-                        stream.set_nodelay(options.nodelay)?;
-                        stream.set_keepalive(options.keepalive)?;
+            info!("try to connect to {}", addr);
+            ConnectingStream::new(addr, &options)
+                .and_then(move |mut stream| {
+                    stream.set_nodelay(options.nodelay)?;
+                    stream.set_keepalive(options.keepalive)?;
 
-                        let transport = ClickhouseTransport::new(stream, compress, pool);
-                        Ok(ClientHandle {
-                            inner: Some(transport),
-                            context,
-                            pool: PoolBinding::None,
-                        })
+                    let transport = ClickhouseTransport::new(stream, compress, pool);
+                    Ok(ClientHandle {
+                        inner: Some(transport),
+                        context,
+                        pool: PoolBinding::None,
                     })
-                    .map_err(Into::into)
-                    .and_then(ClientHandle::hello)
-                    .timeout(timeout)
-                    .map_err(Error::from)
-            }),
-        )
+                })
+                .map_err(Into::into)
+                .and_then(ClientHandle::hello)
+                .timeout(timeout)
+                .map_err(Error::from)
+        }))
     }
 }
 
@@ -577,7 +579,9 @@ fn column_name_to_string(name: &str) -> Result<String, Error> {
     }
 
     if name.chars().any(|ch| ch == '`') {
-        return Err(Error::Other("Column name shouldn't contains backticks.".into()));
+        return Err(Error::Other(
+            "Column name shouldn't contains backticks.".into(),
+        ));
     }
 
     Ok(format!("`{}`", name))

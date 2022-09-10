@@ -5,7 +5,7 @@ use std::{
     sync::{
         self,
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -51,7 +51,7 @@ enum PacketStreamState {
 
 pub(crate) struct TransportStatus {
     inside: AtomicBool,
-    pool: sync::Weak<Inner>,
+    pool: sync::Weak<Mutex<Inner>>,
 }
 
 pub(crate) struct PacketStream {
@@ -89,6 +89,7 @@ impl Drop for TransportStatus {
         }
 
         if let Some(pool_inner) = self.pool.upgrade() {
+            let pool_inner = pool_inner.lock().unwrap();
             pool_inner.release_conn();
         }
     }

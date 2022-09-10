@@ -1,15 +1,19 @@
 use std::{
-    fmt, mem, sync::atomic::{self, Ordering},
-    sync::Arc,
+    fmt, mem,
+    sync::atomic::{self, Ordering},
+    sync::{Arc, Mutex},
 };
 
-use tokio::prelude::{*, task::{self, Task}};
+use tokio::prelude::{
+    task::{self, Task},
+    *,
+};
 
 use crate::{
-    io::BoxFuture,
-    Client, ClientHandle,
     errors::Result,
+    io::BoxFuture,
     types::{IntoOptions, OptionsSource},
+    Client, ClientHandle,
 };
 
 pub use self::futures::GetHandle;
@@ -22,7 +26,6 @@ pub(crate) struct Inner {
     idle: crossbeam::queue::ArrayQueue<ClientHandle>,
     tasks: crossbeam::queue::SegQueue<Task>,
     ongoing: atomic::AtomicUsize,
-    hosts: Vec<Url>,
     connections_num: atomic::AtomicUsize,
 }
 
@@ -32,6 +35,10 @@ impl Inner {
         while let Ok(task) = self.tasks.pop() {
             task.notify()
         }
+    }
+
+    pub(crate) fn inc_connections_num(&self) -> usize {
+        self.connections_num.fetch_add(1, Ordering::SeqCst)
     }
 
     fn conn_count(&self) -> usize {
@@ -96,7 +103,8 @@ impl PoolBinding {
 #[derive(Clone)]
 pub struct Pool {
     options: OptionsSource,
-    pub(crate) inner: Arc<Inner>,
+    pub(crate) inner: Arc<Mutex<Inner>>,
+    hosts: Vec<Url>,
     min: usize,
     max: usize,
 }
@@ -145,29 +153,30 @@ impl Pool {
             Err(err) => error!("{}", err),
         }
 
-        let inner = Arc::new(Inner {
+        let inner = Arc::new(Mutex::new(Inner {
             new: crossbeam::queue::ArrayQueue::new(1),
             idle: crossbeam::queue::ArrayQueue::new(max),
             tasks: crossbeam::queue::SegQueue::new(),
             ongoing: atomic::AtomicUsize::new(0),
             connections_num: atomic::AtomicUsize::new(0),
-            hosts,
-        });
+        }));
 
         Self {
             options: options_src,
             inner,
+            hosts,
             min,
             max,
         }
     }
 
     fn info(&self) -> PoolInfo {
+        let inner = self.inner.lock().unwrap();
         PoolInfo {
-            new_len: self.inner.new.len(),
-            idle_len: self.inner.idle.len(),
-            tasks_len: self.inner.tasks.len(),
-            ongoing: self.inner.ongoing.load(Ordering::Acquire),
+            new_len: inner.new.len(),
+            idle_len: inner.idle.len(),
+            tasks_len: inner.tasks.len(),
+            ongoing: inner.ongoing.load(Ordering::Acquire),
         }
     }
 
@@ -183,12 +192,13 @@ impl Pool {
             Some(client) => Ok(Async::Ready(client)),
             None => {
                 let new_conn_created = {
-                    let conn_count = self.inner.conn_count();
+                    let inner = self.inner.lock().unwrap();
+                    let conn_count = inner.conn_count();
 
-                    if conn_count < self.max && self.inner.new.push(self.new_connection()).is_ok() {
+                    if conn_count < self.max && inner.new.push(self.new_connection()).is_ok() {
                         true
                     } else {
-                        self.inner.tasks.push(task::current());
+                        inner.tasks.push(task::current());
                         false
                     }
                 };
@@ -206,8 +216,8 @@ impl Pool {
     }
 
     fn handle_futures(&mut self) -> Result<()> {
-        let inner = &self.inner;
-        if let Ok(mut new) = self.inner.new.pop() {
+        let inner = self.inner.lock().unwrap();
+        if let Ok(mut new) = inner.new.pop() {
             match new.poll() {
                 Ok(Async::Ready(client)) => {
                     inner.idle.push(client).unwrap();
@@ -216,8 +226,8 @@ impl Pool {
                     // NOTE: it is okay to drop the construction task
                     // because another construction will be attempted
                     // later in Pool::poll
-                    let _ = self.inner.new.push(new);
-                },
+                    let _ = inner.new.push(new);
+                }
                 Err(err) => {
                     return Err(err);
                 }
@@ -228,10 +238,11 @@ impl Pool {
     }
 
     fn take_conn(&mut self) -> Option<ClientHandle> {
-        if let Ok(mut client) = self.inner.idle.pop() {
+        let inner = self.inner.lock().unwrap();
+        if let Ok(mut client) = inner.idle.pop() {
             client.pool = PoolBinding::Attached(self.clone());
             client.set_inside(false);
-            self.inner.ongoing.fetch_add(1, Ordering::AcqRel);
+            inner.ongoing.fetch_add(1, Ordering::AcqRel);
             Some(client)
         } else {
             None
@@ -245,20 +256,20 @@ impl Pool {
         client.pool = PoolBinding::None;
         client.set_inside(true);
 
-        if self.inner.idle.len() < min && is_attached {
-            let _ = self.inner.idle.push(client);
+        let inner = self.inner.lock().unwrap();
+        if inner.idle.len() < min && is_attached {
+            let _ = inner.idle.push(client);
         }
-        self.inner.ongoing.fetch_sub(1, Ordering::AcqRel);
+        inner.ongoing.fetch_sub(1, Ordering::AcqRel);
 
-        while let Ok(task) = self.inner.tasks.pop() {
+        while let Ok(task) = inner.tasks.pop() {
             task.notify()
         }
     }
 
-    pub(crate) fn get_addr(&self) -> &Url {
-        let n = self.inner.hosts.len();
-        let index = self.inner.connections_num.fetch_add(1, Ordering::SeqCst);
-        &self.inner.hosts[index % n]
+    pub(crate) fn get_addr(&self, index: usize) -> &Url {
+        let n = self.hosts.len();
+        &self.hosts[index % n]
     }
 }
 
@@ -326,9 +337,7 @@ mod test {
 
         let done = pool
             .get_handle()
-            .and_then(|c| {
-                c.ping().map(|_| ())
-            })
+            .and_then(|c| c.ping().map(|_| ()))
             .and_then(move |_| {
                 let info = pool.info();
                 assert_eq!(info.ongoing, 0);
@@ -492,16 +501,14 @@ mod test {
         let url = format!("{}{}", DATABASE_URL.as_str(), "&query_block_timeout=10ms");
         let pool = Pool::new(url);
 
-        let done = pool
-            .get_handle()
-            .and_then(|c| {
-                c.query("SELECT sleep(10)")
-                    .stream_blocks()
-                    .for_each(|block| {
-                        println!("{:?}\nblock counts: {} rows", block, block.row_count());
-                        Ok(())
-                    })
-            });
+        let done = pool.get_handle().and_then(|c| {
+            c.query("SELECT sleep(10)")
+                .stream_blocks()
+                .for_each(|block| {
+                    println!("{:?}\nblock counts: {} rows", block, block.row_count());
+                    Ok(())
+                })
+        });
 
         run(done).unwrap_err();
 
@@ -556,7 +563,7 @@ mod test {
             let done = pool
                 .get_handle()
                 .and_then(move |c| c.ping())
-                .and_then(move |_|{
+                .and_then(move |_| {
                     counter.fetch_add(1, Ordering::Relaxed);
                     Ok(())
                 })
@@ -584,12 +591,26 @@ mod test {
 
     #[test]
     fn test_get_addr() {
-        let options = Options::from_str("tcp://host1:9000?alt_hosts=host2:9000,host3:9000").unwrap();
+        let options =
+            Options::from_str("tcp://host1:9000?alt_hosts=host2:9000,host3:9000").unwrap();
         let pool = Pool::new(options);
 
-        assert_eq!(pool.get_addr(), &Url::from_str("tcp://host1:9000").unwrap());
-        assert_eq!(pool.get_addr(), &Url::from_str("tcp://host2:9000").unwrap());
-        assert_eq!(pool.get_addr(), &Url::from_str("tcp://host3:9000").unwrap());
-        assert_eq!(pool.get_addr(), &Url::from_str("tcp://host1:9000").unwrap())
+        let inner = pool.inner.lock().unwrap();
+        assert_eq!(
+            pool.get_addr(inner.inc_connections_num()),
+            &Url::from_str("tcp://host1:9000").unwrap()
+        );
+        assert_eq!(
+            pool.get_addr(inner.inc_connections_num()),
+            &Url::from_str("tcp://host2:9000").unwrap()
+        );
+        assert_eq!(
+            pool.get_addr(inner.inc_connections_num()),
+            &Url::from_str("tcp://host3:9000").unwrap()
+        );
+        assert_eq!(
+            pool.get_addr(inner.inc_connections_num()),
+            &Url::from_str("tcp://host1:9000").unwrap()
+        )
     }
 }
